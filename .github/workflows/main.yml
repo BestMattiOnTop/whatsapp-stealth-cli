@@ -1,0 +1,33 @@
+name: main
+
+on:
+  push:
+    branches: 
+    - main
+  pull_request:
+    branches: 
+    - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v6
+
+    - name: Setup NodeJS
+      uses: actions/setup-node@v6
+      with:
+        node-version: "24.x"
+
+    - name: Force HTTPS
+      run: git config --global url."https://github".insteadOf ssh://git@github
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Build
+      run: npm run build
+
+    - name: Run tests
+      run: npm test
