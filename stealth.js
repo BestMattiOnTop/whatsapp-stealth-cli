@@ -2,18 +2,42 @@ const { default: makeWASocket, useMultiFileAuthState, fetchLatestWaWebVersion } 
 const pino = require('pino');
 const os = require('os');
 const path = require('path');
+const fs = require('fs');
 const readline = require('readline');
 
 let lastSenderJid = null;
 let lastSenderName = null;
 const messageHistory = []; 
-const recentContacts = new Map(); // Mappa numero -> Nome
+
+// Cartella cache
+const cacheFolder = path.join(os.homedir(), '.local', 'share', 'mudslide');
+const contactsFile = path.join(cacheFolder, 'stealth_contacts.json');
+
+// Mappa globale dei contatti salvata su file per resistere ai riavvii
+let allContacts = new Map();
+
+// Carica i contatti dal file
+if (fs.existsSync(contactsFile)) {
+    try {
+        const data = JSON.parse(fs.readFileSync(contactsFile, 'utf8'));
+        allContacts = new Map(Object.entries(data));
+    } catch (e) {
+        console.error("Errore nel caricamento della rubrica:", e.message);
+    }
+}
+
+function saveContacts() {
+    try {
+        const obj = Object.fromEntries(allContacts);
+        fs.writeFileSync(contactsFile, JSON.stringify(obj, null, 2));
+    } catch (e) {}
+}
+
 const MAX_HISTORY = 10;
 
 async function startService() {
     console.log("Starting node-daemon-sync...");
     
-    const cacheFolder = path.join(os.homedir(), '.local', 'share', 'mudslide');
     const { state, saveCreds } = await useMultiFileAuthState(cacheFolder);
     const { version } = await fetchLatestWaWebVersion({});
 
@@ -26,6 +50,20 @@ async function startService() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Salva in memoria TUTTI i contatti quando WhatsApp li sincronizza all'avvio
+    sock.ev.on('contacts.upsert', (contacts) => {
+        let changed = false;
+        for (const contact of contacts) {
+            const num = contact.id.split('@')[0];
+            const name = contact.name || contact.notify || contact.verifiedName;
+            if (name) {
+                allContacts.set(num, name);
+                changed = true;
+            }
+        }
+        if (changed) saveContacts();
+    });
+
     sock.ev.on('connection.update', (update) => {
         const { connection } = update;
         if(connection === 'close') {
@@ -34,13 +72,14 @@ async function startService() {
         } else if(connection === 'open') {
             console.log('Service connection established. [Status: OK]\n');
             console.log('Available commands:');
-            console.log('  r <text>       - Reply to last');
-            console.log('  n <num> <text> - Send to number (include country code, e.g. 39...)');
-            console.log('  v              - Mark last chat as read (send blue ticks)');
-            console.log('  h              - Show recent history');
-            console.log('  l              - List recent contacts (Names & Numbers)');
-            console.log('  c              - Clear screen');
-            console.log('  q              - Quit daemon\n');
+            console.log('  r <text>          - Reply to last');
+            console.log('  n <name> <text>   - Send to a known contact (e.g. n cla hi)');
+            console.log('  w <num> <text>    - Send to a NEW number (e.g. w 39333... hi)');
+            console.log('  v                 - Mark last chat as read (send blue ticks)');
+            console.log('  h                 - Show recent history');
+            console.log('  l                 - List known contacts');
+            console.log('  c                 - Clear screen');
+            console.log('  q                 - Quit daemon\n');
         }
     });
 
@@ -51,11 +90,12 @@ async function startService() {
                     lastSenderJid = msg.key.remoteJid; 
                     lastSenderName = lastSenderJid.split('@')[0];
                     
-                    // Ottiene il nome pubblico impostato dall'utente su WhatsApp
-                    const pushName = msg.pushName || "Sconosciuto";
+                    const pushName = msg.pushName || allContacts.get(lastSenderName) || "Sconosciuto";
                     
-                    // Salva in rubrica temporanea
-                    recentContacts.set(lastSenderName, pushName);
+                    if (pushName !== "Sconosciuto") {
+                        allContacts.set(lastSenderName, pushName);
+                        saveContacts();
+                    }
                     
                     const text = msg.message.conversation || 
                                  msg.message.extendedTextMessage?.text || 
@@ -91,33 +131,63 @@ async function startService() {
                 }
                 await sock.sendPresenceUpdate('unavailable', lastSenderJid); 
                 await sock.sendMessage(lastSenderJid, { text: arg });
-                console.log(`[SND] OK -> ${recentContacts.get(lastSenderName) || lastSenderName}`);
+                console.log(`[SND] OK -> ${allContacts.get(lastSenderName) || lastSenderName}`);
             } 
             else if (cmd === 'n') {
-                const match = line.match(/^n\s+([0-9]+)[\s,]+(.+)$/i);
+                const match = line.match(/^n\s+([^\s]+)\s+(.+)$/i);
                 if (match) {
-                    let num = match[1];
-                    // Se l'utente dimentica il 39, lo avvisa o lo aggiunge. Per sicurezza gli diciamo di scriverlo per intero.
-                    if (num.length <= 10) {
-                        console.log("[WARN] You might have forgotten the country code (e.g., 39). Sending anyway...");
-                    }
+                    const target = match[1];
                     const text = match[2];
+                    let num = null;
+                    let foundName = null;
+
+                    const targetLower = target.toLowerCase();
+                    for (let [contactNum, contactName] of allContacts.entries()) {
+                        if (contactName.toLowerCase().includes(targetLower)) {
+                            num = contactNum;
+                            foundName = contactName;
+                            break;
+                        }
+                    }
+
+                    if (!num) {
+                        console.log(`System error: Contact '${target}' not found. If it's a new number, use the 'w' command instead.`);
+                        return;
+                    }
+
                     const jid = num.includes('@') ? num : num + '@s.whatsapp.net';
                     
                     await sock.sendPresenceUpdate('unavailable', jid);
                     await sock.sendMessage(jid, { text: text });
-                    console.log(`[SND] OK -> ${num}`);
+                    console.log(`[SND] OK -> ${foundName || num}`);
                 } else {
-                    console.log("Syntax error. Use: n <country_code+number> <text>");
+                    console.log("Syntax error. Use: n <name> <text>");
+                }
+            }
+            else if (cmd === 'w') {
+                const match = line.match(/^w\s+([0-9]+)[\s,]+(.+)$/i);
+                if (match) {
+                    const num = match[1];
+                    const text = match[2];
+                    if (num.length <= 10) {
+                        console.log("[WARN] You might have forgotten the country code (e.g., 39). Sending anyway...");
+                    }
+                    const jid = num.includes('@') ? num : num + '@s.whatsapp.net';
+                    
+                    await sock.sendPresenceUpdate('unavailable', jid);
+                    await sock.sendMessage(jid, { text: text });
+                    console.log(`[SND] OK -> ${num} (New Number)`);
+                } else {
+                    console.log("Syntax error. Use: w <number> <text>");
                 }
             }
             else if (cmd === 'l') {
-                console.log("\n--- Recent Contacts ---");
-                if (recentContacts.size === 0) console.log("Empty.");
-                for (let [num, name] of recentContacts.entries()) {
+                console.log("\n--- Known Contacts ---");
+                if (allContacts.size === 0) console.log("Empty. Contacts will be added as they message you.");
+                for (let [num, name] of allContacts.entries()) {
                     console.log(`- ${name} (Num: ${num})`);
                 }
-                console.log("-----------------------\n");
+                console.log("----------------------\n");
             }
             else if (cmd === 'v') {
                 if (!lastSenderJid) {
@@ -125,7 +195,7 @@ async function startService() {
                     return;
                 }
                 await sock.readMessages([{ remoteJid: lastSenderJid, id: 'status', participant: undefined }]);
-                console.log(`[STATUS] Marked as read for ${recentContacts.get(lastSenderName) || lastSenderName}`);
+                console.log(`[STATUS] Marked as read for ${allContacts.get(lastSenderName) || lastSenderName}`);
             }
             else if (cmd === 'h') {
                 console.log("\n--- Recent History ---");
